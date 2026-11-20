@@ -1,0 +1,111 @@
+Tsclp v2.3.3-stage1 — РЕЗУЛЬТАТЫ ТЕСТОВ
+Дата прогона: 2026-11-20 18:20 UTC
+Окружение: Linux sandbox, Python 3.12.16, pytest 9.0.2
+
+==================================================================
+1. НОВЫЕ ИНТЕГРАЦИОННЫЕ ТЕСТЫ ОТДЕЛЬНО: pytest tests/test_v233_partial_sell_reopen_defect.py -v
+==================================================================
+collecting ... collected 7 items
+tests/test_v233_partial_sell_reopen_defect.py::test_1_partialfill_broker_match_does_not_reopen PASSED [ 14%]
+tests/test_v233_partial_sell_reopen_defect.py::test_2_repeated_cycles_partialfill_no_resell PASSED [ 28%]
+tests/test_v233_partial_sell_reopen_defect.py::test_3_cancelled_partial_resolves_open_after_broker_match PASSED [ 42%]
+tests/test_v233_partial_sell_reopen_defect.py::test_4_snapshot_not_reconciled_stays_uncertain PASSED [ 57%]
+tests/test_v233_partial_sell_reopen_defect.py::test_5_new_order_does_not_reopen_for_sltp PASSED [ 71%]
+tests/test_v233_partial_sell_reopen_defect.py::test_6_none_snapshot_does_not_weaken_state PASSED [ 85%]
+tests/test_v233_partial_sell_reopen_defect.py::test_7_duplicate_reports_after_terminal_resolution PASSED [100%]
+============================== 7 passed in 1.36s ===============================
+
+Итог: 7 passed — все обязательные сценарии ТЗ выполняются.
+
+==================================================================
+2. ВЕРИФИКАЦИЯ ТЕСТОВ: прогон НОВЫХ тестов на ДЕФЕКТНОМ коде v2.3.2
+==================================================================
+tests/test_v233_partial_sell_reopen_defect.py:537: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_v233_partial_sell_reopen_defect.py::test_1_partialfill_broker_match_does_not_reopen
+FAILED tests/test_v233_partial_sell_reopen_defect.py::test_2_repeated_cycles_partialfill_no_resell
+FAILED tests/test_v233_partial_sell_reopen_defect.py::test_3_cancelled_partial_resolves_open_after_broker_match
+FAILED tests/test_v233_partial_sell_reopen_defect.py::test_6_none_snapshot_does_not_weaken_state
+FAILED tests/test_v233_partial_sell_reopen_defect.py::test_7_duplicate_reports_after_terminal_resolution
+5 failed, 2 passed in 1.30s
+
+Итог: 5 failed, 2 passed — падают именно дефект-специфичные сценарии
+(1, 2, 3, 6, 7: переоткрытие по совпадению количества при живой
+SELL / повторная SELL / разрешение CANCELLED / None-снимок / дубли
+отчётов). Сценарии 4 и 5 проходили и в v2.3.2 (несогласованный
+снимок/NEW не открывали позицию и раньше) — сохранены как регрессионные.
+
+==================================================================
+3. ОБНОВЛЁННЫЕ СУЩЕСТВУЮЩИЕ ТЕСТЫ ОТДЕЛЬНО
+==================================================================
+.........................                                                [100%]
+25 passed in 1.55s
+
+Итог: 25 passed — тесты, кодировавшие старое дефектное поведение,
+обновлены под новый контракт (см. README_АУДИТ_v2.3.3.md, раздел 6).
+
+==================================================================
+4. ПОЛНЫЙ НАБОР: python -m pytest tests/
+==================================================================
+E        +    where <MagicMock id='140220508464160'> = main.is_trading_enabled
+
+tests/test_trading_flag.py:159: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_main.py::test_trading_cycle_not_fill_but_executed_creates_position
+FAILED tests/test_p0_batch2_late_execution.py::test_n3_unknown_figi_execution_not_registered_global_block
+FAILED tests/test_p0_batch2_late_execution.py::test_integration_trading_cycle_partial_cancel_recovery_open_late_lots
+FAILED tests/test_p0_defect_fixes.py::test_scenario_1_partial_buy_cancelled_portfolio_silent
+FAILED tests/test_p0_defect_fixes.py::test_defect4_unknown_side_resolves_only_without_execution
+FAILED tests/test_persistence.py::test_save_state_creates_file - AssertionErr...
+FAILED tests/test_persistence.py::test_load_state_restores_positions_and_counts
+FAILED tests/test_persistence.py::test_subprocess_saves_state_then_killed - A...
+FAILED tests/test_persistence.py::test_second_process_restores_state - Assert...
+FAILED tests/test_persistence.py::test_save_state_write_error_returns_false
+FAILED tests/test_screener.py::test_screener_returns_top_n - assert None is n...
+FAILED tests/test_screener.py::test_screener_valid_result_less_than_10 - asse...
+FAILED tests/test_screener.py::test_screener_filters_low_turnover - assert 1 ...
+FAILED tests/test_screener.py::test_screener_cache - assert 4 == 1
+FAILED tests/test_screener.py::test_screener_partial_scan_returns_none - asse...
+FAILED tests/test_screener.py::test_screener_error_does_not_return_stale_cache
+FAILED tests/test_strategy.py::test_adx_same_candle_does_not_increase_streak
+FAILED tests/test_strategy.py::test_adx_flips_after_two_new_candles - Attribu...
+FAILED tests/test_strategy.py::test_adx_candidate_reversal_resets_streak - At...
+FAILED tests/test_tinkoff_client.py::test_get_sandbox_max_lots_ok - Assertion...
+FAILED tests/test_tinkoff_client.py::test_get_sandbox_max_lots_sell_none - As...
+FAILED tests/test_tinkoff_client.py::test_get_sandbox_max_lots_with_price - T...
+FAILED tests/test_trading_flag.py::test_is_trading_enabled_false - AssertionE...
+FAILED tests/test_trading_flag.py::test_stop_trading_does_not_touch_positions
+FAILED tests/test_trading_flag.py::test_no_flag_blocks_new_entries - Assertio...
+25 failed, 321 passed in 6.19s
+
+Итог: 321 passed, 25 failed — все 25 падений ИДЕНТИЧНЫ базе v2.3.2
+(среда/внешние зависимости: screener, strategy ADX, tinkoff_client,
+persistence, trading_flag, p0_batch2/p0_defects — см. список ниже).
+НОВЫХ ПАДЕНИЙ НЕТ (diff списка падений с базой v2.3.2 пуст).
+
+Список оставшихся падений (идентичен v2.3.2):
+  FAILED tests/test_main.py::test_trading_cycle_not_fill_but_executed_creates_position
+  FAILED tests/test_p0_batch2_late_execution.py::test_integration_trading_cycle_partial_cancel_recovery_open_late_lots
+  FAILED tests/test_p0_batch2_late_execution.py::test_n3_unknown_figi_execution_not_registered_global_block
+  FAILED tests/test_p0_defect_fixes.py::test_defect4_unknown_side_resolves_only_without_execution
+  FAILED tests/test_p0_defect_fixes.py::test_scenario_1_partial_buy_cancelled_portfolio_silent
+  FAILED tests/test_persistence.py::test_load_state_restores_positions_and_counts
+  FAILED tests/test_persistence.py::test_save_state_creates_file
+  FAILED tests/test_persistence.py::test_save_state_write_error_returns_false
+  FAILED tests/test_persistence.py::test_second_process_restores_state
+  FAILED tests/test_persistence.py::test_subprocess_saves_state_then_killed
+  FAILED tests/test_screener.py::test_screener_cache
+  FAILED tests/test_screener.py::test_screener_error_does_not_return_stale_cache
+  FAILED tests/test_screener.py::test_screener_filters_low_turnover
+  FAILED tests/test_screener.py::test_screener_partial_scan_returns_none
+  FAILED tests/test_screener.py::test_screener_returns_top_n
+  FAILED tests/test_screener.py::test_screener_valid_result_less_than_10
+  FAILED tests/test_strategy.py::test_adx_candidate_reversal_resets_streak
+  FAILED tests/test_strategy.py::test_adx_flips_after_two_new_candles
+  FAILED tests/test_strategy.py::test_adx_same_candle_does_not_increase_streak
+  FAILED tests/test_tinkoff_client.py::test_get_sandbox_max_lots_ok
+  FAILED tests/test_tinkoff_client.py::test_get_sandbox_max_lots_sell_none
+  FAILED tests/test_tinkoff_client.py::test_get_sandbox_max_lots_with_price
+  FAILED tests/test_trading_flag.py::test_is_trading_enabled_false
+  FAILED tests/test_trading_flag.py::test_no_flag_blocks_new_entries
+  FAILED tests/test_trading_flag.py::test_stop_trading_does_not_touch_positions

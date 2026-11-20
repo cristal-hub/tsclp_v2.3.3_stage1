@@ -1,0 +1,259 @@
+# Diff tsclp_v2.3.1_stage1 -> tsclp_v2.3.2_stage1 (изменённые файлы)
+# config.py: BUILD_VERSION bump; execution.py: Дефект 2; main.py: Дефекты 1+2
+# Новый файл tests/test_v232_close_defects.py — см. сборку (8 тестов).
+
+--- tsclp_v2.3.1_stage1/config.py	2026-11-20 16:39:24.101850849 +0000
++++ tsclp_v2.3.2_stage1/config.py	2026-11-20 17:36:30.111604474 +0000
+@@ -46,7 +46,7 @@
+ # только после того, как пакет В (В1-В4) проверен в поле и журнал стабилен.
+ # При True каждый цикл запрашивает свечи по каждой OPEN-позиции (экстремумы
+ # и ATR) — доп. нагрузка ~1 запрос/позиция/цикл.
+-BUILD_VERSION = "v2.3.1-stage1"
++BUILD_VERSION = "v2.3.2-stage1"
+ BE_TRAIL_ENABLED = False
+ BE_TRIGGER_R = 1.0          # r_peak по ДОСТИГНУТОМУ максимуму (mfe_price) для перевода в безубыток
+ TRAIL_ATR_PERIOD = 14       # период ATR для трейлинга (5-минутные свечи)
+
+--- tsclp_v2.3.1_stage1/execution.py	2026-11-20 16:39:56.784018985 +0000
++++ tsclp_v2.3.2_stage1/execution.py	2026-11-20 17:26:48.782566025 +0000
+@@ -2,6 +2,20 @@
+ # Tsclp_v2.2_volatile — мониторинг позиций.
+ # Полная замена: совместимость с API Samsung + per-order учёт SELL.
+ #
++# ИЗМЕНЕНИЯ (v2.3.2-stage1 — аудит v2.3.1, Дефект 2 «обход двойного
++# подтверждения через UNCERTAIN»):
++#   - resolve_uncertain(): ветка «позиция отсутствует у брокера» БОЛЬШЕ НЕ
++#     закрывает учёт по одному достоверному снимку (прежнее поведение
++#     v2.3.1: мгновенный CLOSED с EXTERNAL_CLOSE — обход механизма В3).
++#     Позиция ОСТАЁТСЯ в UNCERTAIN; внешнее закрытие возможно только через
++#     единый механизм В3 (main.py::_try_resolve_absent_position — два
++#     достоверных снимка с интервалом >= RECONCILE_CONFIRM_MIN_AGE_SECONDS),
++#     закрытие собственной SELL-заявкой — только по её терминальному
++#     отчёту (resolve_closing/apply_close_execution, В2). Повторная
++#     отправка SELL невозможна (SL/TP действуют только на OPEN), новые BUY
++#     по FIGI заблокированы. P0-5, OrderLedger, per-order cursor и
++#     fail-closed не ослаблены.
++#
+ # ИЗМЕНЕНИЯ (v2.3.1-stage1 — аудит ТЗ v2.3, пункты 4/5):
+ #   - TrackedPosition.exit_price_confirmed: True ТОЛЬКО когда цена выхода
+ #     взята из реального исполненного close-ордера этой позиции
+@@ -11,10 +25,9 @@
+ #     CSV-строка пишется БЕЗ P&L (поля пустые, error_note=PRICE_UNKNOWN),
+ #     cumulative не искажается. Поле сериализуется в state.json; старый
+ #     state.json восстанавливается с False (from_dict setdefault).
+-#   - resolve_uncertain(): ветка «позиция отсутствует у брокера» ставит
+-#     close_reason=EXTERNAL_CLOSE (если причина не была задана), пометку
+-#     error_note и exit_price_confirmed=False — учёт закрывается, но P&L
+-#     не выдумывается.
++#   - resolve_uncertain(): ветка «позиция отсутствует у брокера» ставила
++#     close_reason=EXTERNAL_CLOSE и закрывала учёт по одному снимку —
++#     поведение отменено в v2.3.2-stage1 (см. шапку выше).
+ #   Торговая логика (SL/TP, закрытия, промоция) не менялась.
+ #
+ # ИЗМЕНЕНИЯ (исправление потери первичной регистрации BUY — guard
+@@ -709,24 +722,35 @@
+     def resolve_uncertain(self, pos, broker_positions):
+         broker = broker_positions.get(pos.figi)
+         if broker is None:
+-            # v2.3.1-stage1 (ТЗ-4/5): позиция исчезла у брокера при UNCERTAIN.
+-            # Учёт закрывается, но цена исполнения НЕИЗВЕСТНА (close-ордер
+-            # либо не исполнялся, либо его отчёт не подтверждён) — P&L
+-            # рассчитываться не будет (exit_price_confirmed=False,
+-            # CSV-строка получит пустые P&L-поля и error_note).
+-            # Цена/исполнение close-ордера этой позиции опрашиваются в
+-            # process_closing ДО вызова resolve_uncertain (шаг resolve_closing
+-            # для UNCERTAIN с close_order_id) — если ордер исполнялся, учёт
+-            # закроется с реальной ценой ещё там.
+-            pos.quantity = 0
+-            pos.state = PositionState.CLOSED
+-            pos.exit_price_confirmed = False
+-            if not pos.close_reason:
+-                pos.close_reason = "EXTERNAL_CLOSE"
+-            pos.error_note = (
+-                "EXTERNAL_CLOSE: позиция отсутствует у брокера при разрешении "
+-                "UNCERTAIN; цена исполнения неизвестна — P&L не рассчитан"
+-            )
++            # v2.3.2-stage1 (Дефект-2: обход двойного подтверждения через
++            # UNCERTAIN). РАНЬШЕ позиция здесь немедленно закрывалась по
++            # ОДНОМУ достоверному снимку «позиция отсутствует» — это
++            # обходило механизм В3 (два достоверных снимка с минимальным
++            # интервалом) и закрывало учёт, пока исход собственной
++            # SELL-заявки не подтверждён (кейс: UNCERTAIN + позиция
++            # исчезла -> мгновенный CLOSED с неизвестной ценой).
++            # ТЕПЕРЬ: отсутствие позиции у брокера при UNCERTAIN учёт НЕ
++            # закрывает. Позиция ОСТАЁТСЯ в UNCERTAIN:
++            #   - исполнение собственной close-заявки разрешится штатно:
++            #     process_closing -> resolve_closing -> apply_close_execution
++            #     (per-order cursor, идемпотентно) с РЕАЛЬНОЙ ценой, либо
++            #     В2 в reconcile (достоверный ТЕРМИНАЛЬНЫЙ отчёт реестра);
++            #   - внешнее закрытие проходит ТОЛЬКО через единый механизм В3
++            #     (_try_resolve_absent_position в reconcile): первый
++            #     достоверный снимок -> кандидат, закрытие — только после
++            #     ВТОРОГО достоверного снимка с интервалом не меньше
++            #     RECONCILE_CONFIRM_MIN_AGE_SECONDS;
++            #   - get_positions()=None (недостоверный снимок) сюда не доходит:
++            #     process_closing при None не вызывает resolve_uncertain и не
++            #     трогает кандидатов В3 — снимок НИ подтверждает, НИ сбрасывает
++            #     подозрение;
++            #   - повторная отправка SELL не выполняется: SL/TP действуют
++            #     только на OPEN (check_all), close_position для UNCERTAIN
++            #     не вызывается;
++            #   - новые BUY по FIGI заблокированы (UNCERTAIN в реестре/
++            #     ACTIVE_STATES + client.uncertain_state), P0-5/OrderLedger/
++            #     fail-closed не затронуты.
++            pos.state = PositionState.UNCERTAIN
+             return
+         if getattr(broker, "direction", "UNKNOWN") == "UNKNOWN":
+             pos.state = PositionState.UNCERTAIN
+
+--- tsclp_v2.3.1_stage1/main.py	2026-11-20 16:43:27.832163695 +0000
++++ tsclp_v2.3.2_stage1/main.py	2026-11-20 17:26:34.873492450 +0000
+@@ -335,6 +335,44 @@
+ #       исполнение SELL: учёт закрывается только по подтверждённым лотам,
+ #       остаток — с пометкой в error_note (прежнее поведение В2).
+ #
++# ИЗМЕНЕНИЯ (v2.3.2-stage1 — аудит v2.3.1: два блокирующих дефекта закрытия):
++#
++#   Дефект 1. Нетерминальная SELL-заявка (_try_resolve_absent_position, В2).
++#       РАНЬШЕ: если запись реестра/отчёт брокера давали executed_lots>0 при
++#       НЕТЕРМИНАЛЬНОМ статусе (NEW/PARTIALLYFILL/неизвестен), учёт позиции
++#       закрывался немедленно (LEDGER_CLOSE по частично исполненной ЖИВОЙ
++#       заявке) — исполнение могло продолжиться/отмениться после закрытия
++#       учёта.
++#       ТЕПЕРЬ: окончательным исполнением считается ТОЛЬКО терминальный
++#       статус (FILL/CANCELLED/REJECTED/EXPIRED). Нетерминальный статус с
++#       executed_lots>0 -> новое действие "uncertain": учёт НЕ закрывается,
++#       позиция переводится в UNCERTAIN, повторная отправка SELL не
++#       выполняется, новые входы блокируются (mismatch-путь reconcile).
++#       Разрешение — только терминальный отчёт этой заявки (В2 закроет учёт
++#       с подтверждённой ценой) или достоверный отказ без исполнения (В3).
++#
++#   Дефект 2. Обход двойного подтверждения через UNCERTAIN
++#       (resolve_uncertain в execution.py + process_closing в main.py).
++#       РАНЬШЕ: UNCERTAIN-позиция, отсутствующая у брокера, закрывалась
++#       немедленно по ОДНОМУ достоверному снимку (мгновенный CLOSED,
++#       EXTERNAL_CLOSE) — в обход механизма В3 (два достоверных снимка с
++#       минимальным интервалом) и без подтверждения исхода собственной
++#       SELL-заявки.
++#       ТЕПЕРЬ: resolve_uncertain при отсутствии позиции у брокера учёт НЕ
++#       закрывает — позиция остаётся UNCERTAIN. Все пути закрытия
++#       UNCERTAIN-позиции:
++#         а) СВОЯ SELL-заявка: терминальный отчёт (resolve_closing ->
++#            apply_close_execution, per-order cursor, идемпотентно) или В2
++#            в reconcile — учёт закрывается с РЕАЛЬНОЙ ценой исполнения;
++#         б) внешнее закрытие — ТОЛЬКО единый механизм В3
++#            (_try_resolve_absent_position): первый достоверный снимок
++#            регистрирует кандидата, закрытие — после второго достоверного
++#            снимка с интервалом >= RECONCILE_CONFIRM_MIN_AGE_SECONDS;
++#         в) get_positions()=None не подтверждает и не сбрасывает
++#            подозрение (process_closing/reconcile при None учёт и
++#            кандидатов не трогают).
++#       P0-5, OrderLedger, per-order cursor, fail-closed — без ослаблений.
++#
+ 
+ import asyncio
+ import csv
+@@ -990,6 +1028,10 @@
+                          двойного подтверждения (В3);
+       "candidate"      — первое обнаружение: учёт НЕ менялся, подтверждение
+                          — на следующей сверке;
++      "uncertain"      — v2.3.2-stage1 (Дефект-1): своя SELL-заявка закрытия
++                         существует, но её статус НЕТЕРМИНАЛЬНЫЙ
++                         (NEW/PARTIALLYFILL/неизвестен) — окончательное
++                         исполнение не доказано, учёт НЕ закрывается;
+       "mismatch"       — разрешить не удалось: прежнее поведение
+                          (RECONCILE_MISMATCH + блокировка новых входов).
+     """
+@@ -1028,6 +1070,46 @@
+                     price = p
+         if executed <= 0:
+             continue  # эта заявка не доказывает исполнение — следующий кандидат
++        # v2.3.2-stage1 (Дефект-1: нетерминальная SELL-заявка). После
++        # уточнения у брокера статус может остаться НЕТЕРМИНАЛЬНЫМ
++        # (NEW / PARTIALLYFILL / UNCERTAIN / UNKNOWN / None) — в том числе
++        # при executed_lots > 0 (частичное исполнение живой заявки, кейс
++        # «SELL 10 лот., исполнено 3, статус PARTIALLYFILL»). Исполнение
++        # такой заявки НЕ окончательно: возможны дополнительные лоты,
++        # отмена или отказ брокера. Раньше учёт закрывался сразу
++        # (LEDGER_CLOSE по частично исполненной живой SELL) — дефект.
++        # Теперь:
++        #   - локальный учёт НЕ закрывается (никакого финального закрытия
++        #     по нетерминальному статусу);
++        #   - повторная отправка SELL не выполняется (заявка уже зарегистрирована;
++        #     SL/TP для UNCERTAIN не действуют — новых close-заявок нет);
++        #   - позиция переводится в UNCERTAIN, новые входы блокируются
++        #     (mismatch-путь в reconcile);
++        #   - разрешение — ТОЛЬКО терминальный отчёт этой SELL-заявки:
++        #     следующий вызов В2 закроет учёт с подтверждённой ценой
++        #     (FILL/CANCELLED/EXPIRED с executed_lots>0) или вернёт позицию
++        #     в штатное русло (REJECTED/CANCELLED без исполнения -> В3).
++        if status not in _TERMINAL_ORDER_STATUSES:
++            pos.state = PositionState.UNCERTAIN
++            client.uncertain_state = True
++            logging.error(
++                f"[reconcile] {ticker}: SELL-заявка закрытия {oid} НЕТЕРМИНАЛЬНА "
++                f"(status={status}, executed={executed}/{requested}), позиция "
++                f"отсутствует у брокера — окончательное исполнение не доказано: "
++                f"учёт НЕ закрыт, позиция UNCERTAIN, повторная SELL запрещена"
++            )
++            research_logger.log_event("SELL_NON_TERMINAL_CLOSE_BLOCKED", {
++                "figi": pos.figi, "ticker": ticker, "order_id": oid,
++                "status": status, "executed_lots": executed,
++                "requested_lots": requested, "quantity": pos.quantity,
++            })
++            await notify(
++                f"⚠️ <b>{ticker}</b>: позиция отсутствует у брокера, но SELL-заявка "
++                f"закрытия ещё НЕ завершена ({status}, исполнено {executed}/{requested}).\n"
++                f"Окончательное исполнение не доказано — учёт НЕ закрыт (UNCERTAIN), "
++                f"новые входы заблокированы до терминального статуса заявки."
++            )
++            return "uncertain"
+         sold = min(executed, int(pos.quantity) or executed)
+         full = requested > 0 and executed >= requested
+         reason_text = str(rec.get("reason") or "")
+@@ -1292,6 +1374,20 @@
+         if action in ("ledger_close", "external_close"):
+             mutated = True
+             continue
++        if action == "uncertain":
++            # v2.3.2-stage1 (Дефект-1): своя SELL-заявка закрытия в
++            # НЕТЕРМИНАЛЬНОМ статусе (NEW/PARTIALLYFILL/неизвестен) при
++            # отсутствующей у брокера позиции. Учёт НЕ закрыт (позиция
++            # оставлена в UNCERTAIN внутри _try_resolve_absent_position),
++            # повторная отправка SELL не выполнялась. Фиксируем расхождение:
++            # client.uncertain_state=True + reconcile_done=False — новые
++            # входы блокированы до терминального статуса заявки.
++            mismatches.append(
++                f"{figi}: SELL-заявка закрытия в нетерминальном статусе, "
++                f"позиция отсутствует у брокера — учёт не закрывается "
++                f"(ожидание терминального отчёта)"
++            )
++            continue
+         if action == "candidate":
+             # первое обнаружение внешнего закрытия: учёт не менялся;
+             # повторная сверка на следующем цикле (флаг ниже), расхождение
+@@ -1437,12 +1533,24 @@
+     if uncertain_positions:
+         positions = await client.get_positions()
+         if positions is None:
++            # v2.3.2-stage1 (Дефект-2): недостоверный снимок НИ подтверждает,
++            # НИ сбрасывает подозрение на внешнее закрытие: resolve_uncertain
++            # не вызывается, кандидаты В3 (_external_close_candidates) не
++            # трогаются, счётчик интервала двойного подтверждения не
++            # перезапускается. Учёт не меняется.
+             logging.error("[process_closing] get_positions()=None — UNCERTAIN не разрешаются.")
+             client.uncertain_state = True
+             reconcile_done = False
+         else:
+             broker = {f: p for f, p in positions.items()
+                       if not f.startswith(("RUB", "USD", "EUR"))}
++            # v2.3.2-stage1 (Дефект-2): resolve_uncertain при отсутствии
++            # позиции у брокера БОЛЬШЕ НЕ закрывает учёт по одному снимку —
++            # позиция остаётся UNCERTAIN. Внешнее закрытие возможно только
++            # через единый механизм В3 в reconcile ниже (два достоверных
++            # снимка с интервалом >= RECONCILE_CONFIRM_MIN_AGE_SECONDS);
++            # закрытие по СВОЕЙ SELL-заявке — по её терминальному отчёту
++            # (resolve_closing выше / В2 в reconcile).
+             for pos in uncertain_positions:
+                 monitor.resolve_uncertain(pos, broker)
+             # v2.3.0-stage1: передаём ledger и rm — пакет В2/В3 в reconcile

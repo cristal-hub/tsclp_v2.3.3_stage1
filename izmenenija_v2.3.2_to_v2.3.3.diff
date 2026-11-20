@@ -1,0 +1,426 @@
+--- a/execution.py (v2.3.2)
++++ b/execution.py (v2.3.3)
+@@ -2,6 +2,53 @@
+ # Tsclp_v2.2_volatile — мониторинг позиций.
+ # Полная замена: совместимость с API Samsung + per-order учёт SELL.
+ #
++# ИЗМЕНЕНИЯ (v2.3.3-stage1 — дефект «повторное открытие позиции при
++# активной частичной SELL»):
++#   Сценарий дефекта: SELL 10 лот. -> PARTIALLYFILL (исполнено 3) ->
++#   apply_close_execution уменьшил локальное количество до 7 и перевёл
++#   позицию в UNCERTAIN -> process_closing получил достоверный снимок
++#   брокера с остатком 7 лотов -> resolve_uncertain() видел совпадение
++#   broker.lots == pos.quantity и переводил позицию в OPEN, хотя
++#   собственная SELL-заявка ещё не завершена (close_order_id активен).
++#   SL/TP снова включались и могли отправить ПОВТОРНУЮ SELL по позиции
++#   с незавершённой заявкой — перепродажа.
++#   Главный принцип исправления: совпадение локального остатка с
++#   брокерским количеством НЕ является основанием переводить позицию
++#   в OPEN, пока терминальность собственной SELL-заявки не подтверждена.
++#   Инвариант: close_order_id сбрасывается ТОЛЬКО при обработке
++#   терминального отчёта (apply_close_execution / resolve_closing),
++#   поэтому его наличие == «терминальность не подтверждена».
++#     - resolve_uncertain(): совпадение количества при активном
++#       close_order_id больше НЕ переводит позицию в OPEN — позиция
++#       остаётся UNCERTAIN (SL/TP не действуют, повторная SELL
++#       невозможна, новые BUY по FIGI заблокированы).
++#     - apply_close_execution(): терминальный статус (FILL/CANCELLED/
++#       REJECTED/EXPIRED) с ОСТАТКОМ (quantity > 0) больше НЕ переводит
++#       позицию в OPEN немедленно: подтверждённые лоты учтены per-order
++#       cursor'ом, завершённая заявка очищается, но остаток разрешается
++#       в OPEN только после подтверждения брокерским снимком
++#       (resolve_uncertain). Полное исполнение (quantity == 0) по-прежнему
++#       закрывает учёт немедленно (CLOSED).
++#     - apply_close_execution(): защита от противоречивых повторных
++#       отчётов — рост cumulative после учтённого терминального статуса
++#       отклоняется (fail-closed: UNCERTAIN, количество не меняется);
++#       идемпотентный повтор терминального отчёта игнорируется целиком
++#       (ни количества, ни состояния, ни дубля CSV).
++#     - resolve_closing(): отказ/отмена БЕЗ исполнения (REJECTED/CANCELLED
++#       при lots_executed == 0) больше НЕ возвращает позицию в OPEN
++#       немедленно — очистка завершённой заявки + UNCERTAIN; возврат
++#       в OPEN — только через подтверждение брокерским снимком.
++#       Ветви состояний не выполняются при противоречивом отчёте
++#       (apply_close_execution вернул False) — ссылка на заявку
++#       сохраняется для повторного опроса.
++#   Штатные сценарии сохранены: FILL закрывает учёт по фактическим
++#   исполнениям и per-order cursor; CANCELLED с частичным исполнением
++#   разрешает остаток как OPEN после сверки с брокером; REJECTED без
++#   исполнения возвращает позицию в OPEN при подтверждённом совпадении
++#   количества; неизвестный статус/ошибка запроса/None — fail-closed.
++#   Торговая логика (SL/TP, входы, риск-модель) не менялась;
++#   OrderLedger, P0-5, per-order cursor и fail-closed не ослаблены.
++#
+ # ИЗМЕНЕНИЯ (v2.3.2-stage1 — аудит v2.3.1, Дефект 2 «обход двойного
+ # подтверждения через UNCERTAIN»):
+ #   - resolve_uncertain(): ветка «позиция отсутствует у брокера» БОЛЬШЕ НЕ
+@@ -117,6 +164,11 @@
+     PositionState.UNCERTAIN, PositionState.RECOVERY,
+ )
+ 
++# v2.3.3-stage1: терминальные статусы SELL-заявки закрытия. Единый набор
++# с веткой terminal в apply_close_execution; числовые коды — для
++# устойчивости к сырому значению execution_report_status.
++_TERMINAL_SELL_STATUSES = {"FILL", "CANCELLED", "REJECTED", "EXPIRED", "1", "2", "3"}
++
+ 
+ @dataclass
+ class TrackedPosition:
+@@ -463,6 +515,35 @@
+             pos.state = PositionState.UNCERTAIN
+             logging.error(f"[execution] {pos.ticker}: SELL delta {delta} exceeds remaining {pos.quantity}")
+             return False
++        # v2.3.3-stage1: терминальный статус этой заявки УЖЕ учтён — отчёт
++        # «заморожен». Терминальный статус означает, что исполнение заявки
++        # больше не изменится, поэтому:
++        #   - рост cumulative после учтённого терминала — противоречивый
++        #     поздний/дублирующий отчёт: fail-closed, применение ЗАПРЕЩЕНО
++        #     (количество позиции не меняется, повторного применения нет,
++        #     дубль CSV-строки исключён);
++        #   - повтор ТОГО ЖЕ терминального отчёта игнорируется целиком —
++        #     идемпотентность без побочных эффектов на состояние позиции
++        #     (раньше повтор CANCELLED переводил разрешённую позицию
++        #     обратно в OPEN, а повтор PARTIALLYFILL — сбрасывал в
++        #     UNCERTAIN, оба без доказательств).
++        prev_status = str(rec.get("status") or "").upper()
++        if prev_status in _TERMINAL_SELL_STATUSES:
++            if cumulative > previous:
++                pos.state = PositionState.UNCERTAIN
++                logging.error(
++                    f"[execution] {pos.ticker}: cumulative {cumulative} > "
++                    f"учтённого терминального {previous} ({prev_status}) — "
++                    f"противоречивый отчёт по завершённой заявке {oid}, "
++                    f"применение запрещено (fail-closed)"
++                )
++                return False
++            logging.info(
++                f"[execution] {pos.ticker}: повторный терминальный отчёт "
++                f"{oid} ({prev_status}, cumulative={cumulative}) — "
++                f"игнорируется (уже учтён per-order cursor'ом)"
++            )
++            return False
+         # Записываем подтверждение и применение как отдельные поля одной записи.
+         rec["confirmed_executed_lots"] = cumulative
+         rec["status"] = str(status)
+@@ -490,13 +571,21 @@
+         # получена из отчёта исполненного close-ордера (avg_exec_price>0).
+         pos.exit_price_confirmed = rec["avg_exec_price"] is not None
+         pos.actual_commission = rec["commission"]
+-        terminal = str(status).upper() in {"FILL", "CANCELLED", "REJECTED", "EXPIRED", "1", "2", "3"}
++        terminal = str(status).upper() in _TERMINAL_SELL_STATUSES
+         full = cumulative == requested
+         if pos.quantity == 0:
+             pos.state = PositionState.CLOSED
+         elif terminal:
+-            # Частичный терминальный SELL закончен; остаток позиции остаётся OPEN.
+-            pos.state = PositionState.OPEN
++            # v2.3.3-stage1: терминальный отчёт учтён per-order cursor'ом,
++            # завершённая заявка очищается, НО остаток позиции
++            # (quantity > 0) разрешается в OPEN ТОЛЬКО после подтверждения
++            # брокерским снимком (resolve_uncertain в process_closing).
++            # Прежний немедленный OPEN позволял SL/TP отправить новую SELL
++            # до сверки локального остатка с брокерским — риск перепродажи
++            # при расхождении. UNCERTAIN безопасен: SL/TP не действуют,
++            # новые BUY по FIGI заблокированы, повторная SELL не
++            # отправляется. Полное исполнение (quantity == 0) закрыто выше.
++            pos.state = PositionState.UNCERTAIN
+             if pos.close_order_id == oid:
+                 pos.close_order_id = None
+                 pos.close_requested_lots = 0
+@@ -705,11 +794,22 @@
+                         f"{legacy_applied} без per-order истории; требуется reconcile"
+                     )
+                     return
+-            self.apply_close_execution(pos, oid, lots, status, price, commission, requested)
++            applied_ok = self.apply_close_execution(
++                pos, oid, lots, status, price, commission, requested
++            )
+             if status_int == 5 and pos.state != PositionState.CLOSED:
+                 pos.state = PositionState.UNCERTAIN
+-            elif status_int in (2, 3) and lots == 0 and pos.state != PositionState.CLOSED:
+-                pos.state = PositionState.OPEN
++            elif (applied_ok and status_int in (2, 3) and lots == 0
++                  and pos.state != PositionState.CLOSED):
++                # v2.3.3-stage1: отказ/отмена БЕЗ исполнения. Заявка
++                # терминальна и очищается, но возврат в OPEN — только после
++                # подтверждения брокерским снимком (resolve_uncertain):
++                # при отсутствии/расхождении позиции у брокера немедленный
++                # OPEN позволял SL/TP отправить обречённую SELL. Ветвь не
++                # выполняется при противоречивом отчёте (applied_ok=False,
++                # в т.ч. замороженный терминальный повтор) — ссылка на
++                # заявку сохраняется для повторного опроса.
++                pos.state = PositionState.UNCERTAIN
+                 pos.close_order_id = None
+                 pos.close_requested_lots = 0
+                 pos.close_applied_lots = 0
+@@ -759,6 +859,32 @@
+         if broker.direction != expected or abs(int(broker.lots)) != pos.quantity:
+             pos.state = PositionState.UNCERTAIN
+             return
++        # v2.3.3-stage1 (дефект «повторное открытие при активной частичной
++        # SELL»): совпадение количества — НЕ основание для OPEN, пока
++        # собственная SELL-заявка закрытия имеет неподтверждённую
++        # терминальность. close_order_id сбрасывается ТОЛЬКО обработкой
++        # терминального отчёта (apply_close_execution / resolve_closing),
++        # поэтому его наличие означает: заявка ещё жива (NEW/PARTIALLYFILL)
++        # или её исход не подтверждён. Кейс дефекта: SELL 10, исполнено 3
++        # (PARTIALLYFILL), локальный остаток 7 == broker.lots 7 — раньше
++        # позиция переводилась в OPEN, SL/TP снова включались и могли
++        # отправить повторную SELL по позиции с незавершённой заявкой
++        # (перепродажа). Теперь позиция остаётся UNCERTAIN: SL/TP не
++        # действуют, повторная SELL невозможна, новые BUY по FIGI
++        # заблокированы (has_active_position). Штатное разрешение
++        # сохранено: терминальный отчёт очищает close_order_id, следующий
++        # достоверный снимок с совпадающим остатком возвращает позицию
++        # в OPEN.
++        if pos.close_order_id:
++            logging.warning(
++                f"[execution] {pos.ticker}: остаток {abs(int(broker.lots))} лот. "
++                f"совпадает с локальным, но SELL-заявка закрытия "
++                f"{pos.close_order_id} ещё не завершена (терминальность не "
++                f"подтверждена) — повторное открытие ЗАПРЕЩЕНО, позиция "
++                f"остаётся UNCERTAIN"
++            )
++            pos.state = PositionState.UNCERTAIN
++            return
+         pos.quantity = abs(int(broker.lots))
+         pos.state = PositionState.OPEN
+ 
+--- a/main.py (v2.3.2)
++++ b/main.py (v2.3.3)
+@@ -1,6 +1,23 @@
+ # main.py
+ # Tsclp_v2.2_volatile — основной цикл (ТОЛЬКО ПЕСОЧНИЦА).
+ #
++# ИЗМЕНЕНИЯ (v2.3.3-stage1 — дефект «повторное открытие позиции при
++# активной частичной SELL»):
++#   - process_closing: защита в глубину после resolve_uncertain — позиция
++#     с неподтверждённой терминальностью close-заявки (close_order_id
++#     установлен) не может остаться в OPEN ни одним путём: немедленный
++#     возврат в UNCERTAIN с ошибкой в журнале. SL/TP (check_all) действуют
++#     только на OPEN, поэтому повторная SELL по позиции с живой заявкой
++#     исключена. Основное исправление — в execution.py (resolve_uncertain
++#     не переводит позицию в OPEN при совпадении количества с брокером,
++#     пока SELL-заявка не подтверждена терминальным отчётом;
++#     apply_close_execution разрешает остаток после терминала только
++#     через брокерский снимок; resolve_closing при REJECTED/CANCELLED
++#     без исполнения больше не возвращает OPEN немедленно) — см. шапку
++#     execution.py. Торговая логика (входы, индикаторы, SL/TP,
++#     риск-модель) не менялась; OrderLedger, P0-5, per-order cursor,
++#     fail-closed и журналы не тронуты.
++#
+ # ИЗМЕНЕНИЯ (этап 4):
+ #   - Цены: TOP-10 + открытые позиции (объединение FIGI).
+ #   - prices=None -> monitoring_error, мониторинг продолжается.
+@@ -1553,6 +1570,20 @@
+             # (resolve_closing выше / В2 в reconcile).
+             for pos in uncertain_positions:
+                 monitor.resolve_uncertain(pos, broker)
++                # v2.3.3-stage1: защита в глубину. Инвариант: позиция с
++                # неподтверждённой терминальностью close-заявки не может
++                # оказаться в OPEN ни одним путём — SL/TP (check_all)
++                # действуют только на OPEN, повторная SELL по позиции с
++                # живой заявкой запрещена (перепродажа). resolve_uncertain
++                # уже соблюдает инвариант (execution.py); проверка
++                # страхует от регрессий будущих путей разрешения.
++                if pos.state == PositionState.OPEN and pos.close_order_id:
++                    logging.error(
++                        f"[process_closing] {pos.ticker}: OPEN при активной "
++                        f"close-заявке {pos.close_order_id} — возврат в "
++                        f"UNCERTAIN (защита от повторной SELL)"
++                    )
++                    pos.state = PositionState.UNCERTAIN
+             # v2.3.0-stage1: передаём ledger и rm — пакет В2/В3 в reconcile
+             # требует реестр, а изменения учёта должны сохраняться немедленно.
+             await reconcile(client, monitor, ledger_ref, rm)
+--- a/tests/test_execution.py (v2.3.2)
++++ b/tests/test_execution.py (v2.3.3)
+@@ -39,13 +39,23 @@
+     )
+     assert p.quantity == 6
+     assert p.close_orders["SELL1"]["applied_lots"] == 4
+-    # terminal cancellation; leftover 6 shares stay open
++    # terminal cancellation; leftover 6 shares NOT re-opened yet:
++    # v2.3.3-stage1 — остаток разрешается в OPEN только после подтверждения
++    # брокерским снимком (resolve_uncertain); завершённая заявка очищена.
+     mod.ExecutionMonitor.apply_close_execution(
+         mod.ExecutionMonitor(None), p, "SELL1", 4, "CANCELLED",
+         requested_lots=10
+     )
+     assert p.quantity == 6
++    assert p.state == PS.UNCERTAIN
++    assert p.close_order_id is None
++    # брокер подтверждает остаток 6 лотов — штатное разрешение остатка
++    m1 = mod.ExecutionMonitor(None)
++    m1.resolve_uncertain(
++        p, {"FIGI1": types.SimpleNamespace(lots=6, direction="LONG")}
++    )
+     assert p.state == PS.OPEN
++    assert p.quantity == 6
+     # second order has a fresh cursor
+     p.close_order_id = "SELL2"
+     p.close_requested_lots = 6
+@@ -85,12 +95,26 @@
+     assert p.state == PS.CLOSED
+ 
+ def test_terminal_partial_sell_reopens_remaining_position():
++    """v2.3.3-stage1: CANCELLED с частичным исполнением учитывает лоты
++    per-order cursor'ом и очищает заявку, но остаток разрешается в OPEN
++    ТОЛЬКО после подтверждения брокерским снимком (resolve_uncertain).
++    Прежнее немедленное OPEN позволяло SL/TP отправить новую SELL до
++    сверки остатка с брокером (риск перепродажи)."""
+     _, p = make_position(7)
+     m = mod.ExecutionMonitor(None)
+     m.add_close_order(p, "S1", 7)
+     m.apply_close_execution(p, "S1", 3, "CANCELLED", requested_lots=7)
+     assert p.quantity == 4
++    assert p.state == PS.UNCERTAIN       # НЕ OPEN: сначала сверка с брокером
++    assert p.close_order_id is None      # завершённая заявка очищена
++    assert p.close_orders["S1"]["status"] == "CANCELLED"
++    assert p.close_orders["S1"]["applied_lots"] == 3
++    # брокер подтверждает остаток 4 лота — штатное разрешение остатка
++    m.resolve_uncertain(
++        p, {"FIGI1": types.SimpleNamespace(lots=4, direction="LONG")}
++    )
+     assert p.state == PS.OPEN
++    assert p.quantity == 4
+ 
+ def test_lower_cumulative_is_uncertain_without_quantity_change():
+     _, p = make_position(7)
+--- a/tests/test_v232_close_defects.py (v2.3.2)
++++ b/tests/test_v232_close_defects.py (v2.3.3)
+@@ -428,9 +428,15 @@
+ 
+ def test_defect2_4_uncertain_sell_rejected_absent_waits_v3(env):
+     """Сценарий 4: UNCERTAIN с SELL REJECTED (0 из 10), позиция исчезла.
+-    Отказ без исполнения не доказывает закрытие позиции: позиция возвращается
+-    в OPEN, отсутствие у брокера — только кандидат В3; закрытие после двойного
+-    подтверждения (цикл 2)."""
++    Отказ без исполнения не доказывает закрытие позиции.
++    v2.3.3-stage1: завершённая заявка очищается, но возврат в OPEN —
++    ТОЛЬКО после подтверждения совпадения количества брокерским снимком
++    (resolve_uncertain); при ОТСУТСТВУЮЩЕЙ позиции подтверждения нет —
++    позиция остаётся UNCERTAIN (безопасное состояние: SL/TP не действуют,
++    повторная SELL невозможна), отсутствие у брокера — кандидат В3;
++    закрытие после двойного подтверждения (цикл 2).
++    Прежнее поведение v2.3.2 (немедленный OPEN без сверки) позволяло
++    SL/TP отправить обречённую SELL по отсутствующей позиции."""
+     tmp_path = env.tmp_path
+     ledger = env.ledger
+     proven_buy(ledger)
+@@ -444,10 +450,12 @@
+     monitor = fresh_monitor(pos, broker)
+     rm = main.RiskManager(None)
+ 
+-    # --- цикл 1: отказ без исполнения -> возврат в OPEN + кандидат В3 ---
++    # --- цикл 1: отказ без исполнения -> заявка очищена, позиция остаётся
++    # UNCERTAIN (v2.3.3: OPEN только после подтверждения брокером) + кандидат В3 ---
+     run(main.trading_cycle(broker, rm, None, monitor, ledger))
+-    assert pos.state == PositionState.OPEN            # своя SELL отклонена — позиция «жива» локально
+-    assert pos.close_order_id is None
++    assert pos.state == PositionState.UNCERTAIN       # возврат в OPEN — только после сверки с брокером
++    assert pos.state != PositionState.OPEN            # немедленного повторного открытия нет
++    assert pos.close_order_id is None                 # завершённая заявка очищена
+     assert pos.quantity == 10
+     assert pos.state != PositionState.CLOSED          # мгновенного закрытия нет
+     assert "F1" in main._external_close_candidates
+--- a/tests/test_manual_close_integration.py (v2.3.2)
++++ b/tests/test_manual_close_integration.py (v2.3.3)
+@@ -165,6 +165,16 @@
+         return list(csv.DictReader(f, delimiter=";"))
+ 
+ 
++def age_candidate(figi, seconds=31.0):
++    """Сдвигает first_seen кандидата В3 в прошлое — имитация разноса двух
++    достоверных снимков >= RECONCILE_CONFIRM_MIN_AGE_SECONDS (продукционный
++    минимум 30 с: два reconcile одного цикла подтверждением НЕ считаются)."""
++    ts = main._external_close_candidates.get(figi)
++    assert ts, f"кандидат {figi} не зарегистрирован — сдвигать нечего"
++    dt = datetime.fromisoformat(ts) - timedelta(seconds=seconds)
++    main._external_close_candidates[figi] = dt.isoformat()
++
++
+ @pytest.fixture()
+ def env(tmp_path, monkeypatch):
+     """Изолированная среда: все записи в tmp_path; торговля выключена
+@@ -180,10 +190,17 @@
+     monkeypatch.setattr(main, "STATE_FILE", str(tmp_path / "state.json"))
+     monkeypatch.setattr(main, "STATE_FILE_TMP", str(tmp_path / "state.json.tmp"))
+     monkeypatch.setattr(main, "TRADING_FLAG", str(tmp_path / "trading.flag"))
+-    # Тесты прогоняют циклы мгновенно; разнос двух сверок (min age) покрыт
+-    # юнит-тестами test_stage1_packet_v.py. Здесь = 0, чтобы два цикла
+-    # считались двумя последовательными достоверными сверками.
+-    monkeypatch.setattr(config, "RECONCILE_CONFIRM_MIN_AGE_SECONDS", 0.0)
++    # Тесты прогоняют циклы мгновенно; разнос двух сверок имитируется явно
++    # (age_candidate) — как в test_v232_close_defects.py.
++    # v2.3.3-stage1: минимум ОСТАВЛЕН ПРОИЗВОДИТЕЛЬНЫМ (30 с =
++    # TRADING_CYCLE_SECONDS): при нуле два reconcile ОДНОГО цикла
++    # (process_closing + шаг 4) засчитывались бы за двойное подтверждение
++    # В3 в обход ТЗ-3 — например, когда позиция после терминального
++    # REJECTED остаётся UNCERTAIN и первый reconcile цикла выполняется
++    # в process_closing. Комментарий: разнос снимков >=
++    # RECONCILE_CONFIRM_MIN_AGE_SECONDS — обязательное условие
++    # двойного подтверждения (защита от мгновенного закрытия).
++    monkeypatch.setattr(config, "RECONCILE_CONFIRM_MIN_AGE_SECONDS", 30.0)
+     main._external_close_candidates.clear()
+     main.reconcile_done = False
+     main.state_save_failed = False
+@@ -229,7 +246,9 @@
+     state = json.load(open(tmp_path / "state.json", encoding="utf-8"))
+     assert state["positions"]["F1"]["state"] == "OPEN"  # В1: сохранено в конце цикла
+ 
+-    # --- цикл 2: двойное подтверждение (второй достоверный снимок) ---
++    # --- цикл 2: двойное подтверждение (второй достоверный снимок,
++    # разнос >= RECONCILE_CONFIRM_MIN_AGE_SECONDS) ---
++    age_candidate("F1")
+     run(main.trading_cycle(broker, rm, sm, monitor, ledger))
+     assert pos.state == PositionState.CLOSED
+     assert pos.close_reason == "EXTERNAL_CLOSE"
+@@ -285,6 +304,7 @@
+     assert main._external_close_candidates.get("F1") == first_seen  # кандидат не тронут
+ 
+     broker.positions = {}  # снова достоверный снимок без позиции
++    age_candidate("F1")    # разнос снимков >= минимума — подтверждение разрешено
+     run(main.trading_cycle(broker, rm, None, monitor, ledger))
+     assert pos.state == PositionState.CLOSED
+     assert pos.close_reason == "EXTERNAL_CLOSE"
+@@ -327,8 +347,12 @@
+ 
+ def test_restart_sell_rejected_position_absent_no_false_close(env):
+     """ТЗ-8b: рестарт, свой SELL отклонён (позиция уже продана вручную).
+-    НИКАКОГО мгновенного закрытия: цикл 1 — возврат в OPEN + кандидат В3,
+-    цикл 2 — двойное подтверждение -> EXTERNAL_CLOSE."""
++    НИКАКОГО мгновенного закрытия. v2.3.3-stage1: завершённая заявка
++    очищается, но возврат в OPEN — только после подтверждения совпадения
++    количества брокерским снимком; при ОТСУТСТВУЮЩЕЙ позиции подтверждения
++    нет — позиция остаётся UNCERTAIN (SL/TP не действуют, повторная SELL
++    невозможна), отсутствие у брокера — кандидат В3, цикл 2 — двойное
++    подтверждение -> EXTERNAL_CLOSE."""
+     tmp_path = env.tmp_path
+     ledger = env.ledger
+     proven_buy(ledger)
+@@ -343,16 +367,21 @@
+     monitor = fresh_monitor(pos, broker)
+     rm = main.RiskManager(None)
+ 
+-    # цикл 1: SELL отклонён без исполнения -> позиция возвращается в OPEN;
++    # цикл 1: SELL отклонён без исполнения -> заявка очищена, позиция
++    # остаётся UNCERTAIN (v2.3.3: OPEN только после сверки с брокером);
+     # отсутствие позиции у брокера НЕ закрывается сразу — только кандидат В3
+     run(main.trading_cycle(broker, rm, None, monitor, ledger))
+-    assert pos.state == PositionState.OPEN          # НЕ закрыто ложным образом
++    assert pos.state == PositionState.UNCERTAIN     # НЕ закрыто ложным образом, НЕ открыто без сверки
++    assert pos.state != PositionState.OPEN          # немедленного повторного открытия нет
++    assert pos.close_order_id is None               # завершённая заявка очищена
+     assert "F1" in main._external_close_candidates
+     assert broker.orders_sent == []                 # обречённых повторных SELL нет
+     rows = read_trades(tmp_path)
+     assert len(rows) == 0                           # CSV ещё не пишется
+ 
+-    # цикл 2: двойное подтверждение -> EXTERNAL_CLOSE (без P&L)
++    # цикл 2: двойное подтверждение -> EXTERNAL_CLOSE (без P&L);
++    # разнос двух достоверных снимков >= производительного минимума
++    age_candidate("F1")
+     run(main.trading_cycle(broker, rm, None, monitor, ledger))
+     assert pos.state == PositionState.CLOSED
+     assert pos.close_reason == "EXTERNAL_CLOSE"
